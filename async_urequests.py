@@ -1,12 +1,11 @@
 import gc
-gc.collect()
 import uasyncio as asyncio
-gc.collect()
 gc.threshold(gc.mem_free() // 4 + gc.mem_alloc()) # sets threshold to 1/4 of heap size
+gc.enable()
 
 
+__version__ = "0.1.0"
 HTTP__version__ = "1.0"
-__version__ = (0, 0, 2)
 
 
 class TimeoutError(Exception):
@@ -19,19 +18,20 @@ class ConnectionError(Exception):
 
 class Response:
 
-    def __init__(self, reader, chunked, charset, h):
+    def __init__(self, reader, chunked, charset, h, length):
         self.raw = reader
         self.chunked = chunked
         self.encoder = charset
         self.h = h
+        self.content_length = length
         self.chunk_size = 0
     
     async def read(self, sz=-1):
         content = b''
         # keep reading chunked data
         if self.chunked:
-            sz = 4*1024*1024
-            while True:
+            sz = 4*1024
+            while 1:
                 if self.chunk_size == 0:
                     l = await self.raw.readline() # get Hex size
                     l = l.split(b";", 1)[0]
@@ -49,10 +49,12 @@ class Response:
                     break
         # non chunked data
         else:
-            while True:
-                data = await self.raw.read(sz)
-                if not data or data == b"":
-                    break
+            data = await self.raw.read(min(self.content_length,4096))
+            content += data
+            residual = self.content_length - len(data)
+            while residual > 0:
+                data = await self.raw.read(residual)
+                residual -= len(data)
                 content += data
         return content
     
@@ -73,7 +75,9 @@ class Response:
         return ujson.loads(self.content)
     
     def close(self):
-        pass
+        if self.raw:
+            self.raw.close()
+            self.raw = None
     
     def __repr__(self):
         return "<Response [%d]>" % (self.status_code)
@@ -85,11 +89,8 @@ async def open_connection(host, port, ssl):
     SSL will block
     '''
     from uasyncio import core
-    gc.collect()
     from uasyncio.stream import Stream
-    gc.collect()
     from uerrno import EINPROGRESS
-    gc.collect()
     import usocket as socket
     gc.collect()
 
@@ -161,19 +162,13 @@ async def _requests(method, url, params={}, data=None, headers={}, cookies=None,
         #headers support
         h = ""
         for k in headers:
-            h += k
-            h += ": "
-            h += headers[k]
-            h += "\r\n"
+            h += "{}: {}\r\n".format(k, headers[k])
         # params support
         if params:
             url = url.rstrip("?")
             url += "?"
             for p in params:
-                url += p
-                url += "="
-                url += params[p]
-                url += "&"
+                url += "{}={}&".format(p, params[p])
             url = url[0:len(url)-1]
     except Exception as e:
         raise e
@@ -192,6 +187,7 @@ async def _requests(method, url, params={}, data=None, headers={}, cookies=None,
             json = None
             headers = []
             charset = 'utf-8'
+            content_length = -1
             # read headers
             while True:
                 line = await reader.readline()
@@ -203,6 +199,12 @@ async def _requests(method, url, params={}, data=None, headers={}, cookies=None,
                         chunked = True
                 elif line.startswith(b"Location:"):
                     url = line.rstrip().split(None, 1)[1].decode()
+                elif line.startswith(b"Content-Length:"):
+                    if not chunked:
+                        try:
+                            content_length = int(line.rstrip().split(None, 1)[1].decode())
+                        except:
+                            pass
                 elif line.startswith(b"Content-Type:"):
                     if b"application/json" in line:
                         json = True
@@ -217,8 +219,8 @@ async def _requests(method, url, params={}, data=None, headers={}, cookies=None,
                 await reader.wait_closed()
                 continue
             break
-        
-        resp = Response(reader, chunked, charset, headers)
+
+        resp = Response(reader, chunked, charset, headers, content_length)
         resp.content = await resp.read()
         resp.status_code = status_code
         resp.reason = reason
@@ -233,7 +235,6 @@ async def _requests(method, url, params={}, data=None, headers={}, cookies=None,
         except NameError:
             pass
         gc.collect()
-
 
 async def get(url, timeout=10, **kwargs):
     try:
