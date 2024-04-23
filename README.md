@@ -1,8 +1,13 @@
 # async_urequests
 
-asynchronous urequests for micropython. optional urequests class to make usable synchronously.
+Asynchronous urequests for micropython. Optional urequests class to make usable synchronously.
 
-Tested on ESP32 only with esp32-idf3-20200725-unstable-v1.12-657-g37e1b5c89.bin
+Tested on MicroPython v1.21.0-dirty on 2023-10-11; Pimoroni Badger2040W 2MB with RP2040
+
+Extension of parsing for non-chunked response, introduce reading content length and catch edge case.
+Little code rewrite and (hopefully) optimizations.
+
+Original desciption below:
 
 Requires uasyncio V3.
 
