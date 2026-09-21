@@ -2,10 +2,12 @@
 
 Asynchronous urequests for micropython. Optional urequests class to make usable synchronously.
 
-Tested on MicroPython v1.21.0-dirty on 2023-10-11; Pimoroni Badger2040W 2MB with RP2040
+Tested on MicroPython v1.23.0-dirty on Pimoroni Badger2040W 2MB with RP2040
 
-Extension of parsing for non-chunked response, introduce reading content length and catch edge case.
-Little code rewrite and (hopefully) optimizations.
+Extension of parsing for non-chunked response, introduce reading content length and catch edge cases.
+Major rewrite to catch server and network errors.
+
+Introduce new `MAX_RESPONSE_SIZE` to prevent memory runout on large response size.
 
 Original desciption below:
 
@@ -20,9 +22,9 @@ Notes:
 
   import async_urequests as requests
   
-- Default HTTP version is 1.0, to change HTTP version do: 
+- Default HTTP version is 1.1, to change HTTP version do: 
 
-  requests.HTTP__version__ = "1.1"
+  requests.HTTP__version__ = "1.0"
   
 - supported HTTP methods: GET, HEAD, POST, PUT, DELETE.
 - Returns response with the following properties: 
@@ -45,6 +47,3 @@ Notes:
   r = requests.get("https://192.168.1.100:1234")
   
   *tested with Plex Server
-
-Known Issues:
-- "memory allocation failed" occurs when reading large responses, will raise a ConnectionError.
