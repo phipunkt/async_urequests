@@ -5,7 +5,7 @@ import uasyncio as asyncio
 gc.enable()
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 HTTP__version__ = "1.1"
 MAX_RESPONSE_SIZE = 12 * 1024
 
@@ -38,10 +38,9 @@ class Response:
                     line = await self.raw.readline()  # get Hex size
                     if not line:
                         raise ConnectionError("Connection closed: read chunk size")
-                    line = line.split(b";", 1)[0].strip()
                     try:
-                        self.chunk_size = int(line, 16)  # convert to int
-                    except (ValueError, TypeError):
+                        self.chunk_size = int(line.split(b";", 1)[0], 16)
+                    except ValueError:
                         raise ConnectionError("Invalid HTTP chunk size")
                     if self.chunk_size < 0:
                         raise ConnectionError("Invalid HTTP chunk size")
@@ -126,65 +125,57 @@ class Response:
         return f"<Response [{self.status_code}]>"
 
 
-async def _request_raw(method, url, headers, data, json_data):
-    reader = None
+async def _request_raw(method, url, headers, data, json):
+    reader = writer = None
     try:
-        proto, dummy, host, path = url.split("/", 3)
-    except ValueError:
-        proto, dummy, host = url.split("/", 2)
-        path = ""
-    try:
-        host, port = host.split(":")
-        if proto == "https:":
-            ssl = True
-        elif proto == "http:":
-            ssl = False
-        else:
+        proto, _, rest = url.partition("://")
+        if proto not in ("http", "https"):
             raise ValueError(f"Unsupported protocol: {proto}")
-    except ValueError:
-        if proto == "http:":
-            port = 80
-            ssl = False
-        elif proto == "https:":
-            port = 443
-            ssl = True
+        host, _, path = rest.partition("/")
+        if ":" in host:
+            host, port = host.rsplit(":", 1)
+            port = int(port)
         else:
-            raise ValueError(f"Unsupported protocol: {proto}")
-    try:
-        query = (
-            f"{method} /{path} HTTP/{HTTP__version__}\r\n"
-            + f"Host: {host}\r\nConnection: close\r\n"
-            + f"{headers}"
-        )
-        if "User-Agent:" not in query:
-            query += "User-Agent: compat\r\n"
-        if json_data is not None:
-            assert data is None
+            port = 443 if proto == "https" else 80
+        host_header = f"{host}:{port}" if port not in (443, 80) else host
+        ssl = proto == "https"
+        if headers is None:
+            headers = {}
+        elif not isinstance(headers, dict):
+            raise TypeError("Headers must be a dict")
+        if json is not None:
+            if data is not None:
+                raise ValueError("Supply data OR json data")
             import ujson
 
-            data = ujson.dumps(json_data)
-            if "Content-Type:" not in query:
-                query += "Content-Type: application/json\r\n"
-        if data and "Content-Length:" not in query:
-            query += "Content-Length: {len(data)}\r\n"
-        query += "\r\n"
-
-        reader, writer = await asyncio.open_connection(host, port, ssl)
-        writer.write(query.encode())
+            data = ujson.dumps(json)
+            headers.setdefault("Content-Type", "application/json")
+        if data is not None:
+            if not isinstance(data, bytes):
+                data = data.encode()
+            headers.setdefault("Content-Length", str(len(data)))
+        headers.setdefault("User-Agent", "compat")
+        headers.setdefault("Connection", "close")
+        
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
+        # Send HTTP request with headers
+        writer.write(f"{method} /{path} HTTP/{HTTP__version__}\r\n".encode())
+        writer.write(f"Host: {host_header}\r\n".encode())
+        for key, value in headers.items():
+            writer.write(f"{key}: {value}\r\n".encode())
+        writer.write(b"\r\n")
+        if data: # Send body
+            writer.write(data)
         await writer.drain()
-        # Send body separately to not have one large allocation
-        if data:
-            writer.write(data.encode())
-            await writer.drain()
         return reader
     except Exception:
         if reader is not None:
             try:
-                reader.close()
+                writer.close()
             except Exception:
                 pass
             try:
-                await reader.wait_closed()
+                await writer.wait_closed()
             except Exception:
                 pass
         raise
@@ -197,24 +188,14 @@ async def _requests(
     data=None,
     headers=None,
     cookies=None,
-    files=None,
     auth=None,
     timeout=None,
     allow_redirects=True,
-    proxies=None,
-    hooks=None,
     stream=None,
-    verify=None,
-    cert=None,
     json=None,
 ):
     reader = None
     try:
-        # headers support
-        h = ""
-        if headers:
-            for k in headers:
-                h += f"{k}: {headers[k]}\r\n"
         # params support
         if params:
             url = url.rstrip("?") + "?"
@@ -224,15 +205,12 @@ async def _requests(
                     url += "&"
                 url += f"{p}={params[p]}"
                 first = False
-    except Exception as e:
-        raise e
-    try:
         # build in redirect support
         redir_cnt = 0
         redir_url = None
         while redir_cnt < 2:
             reader = await _request_raw(
-                method=method, url=url, headers=h, data=data, json_data=json
+                method=method, url=url, headers=headers, data=data, json=json
             )
             sline = await reader.readline()
             sline = sline.split(None, 2)
@@ -256,29 +234,34 @@ async def _requests(
                 if not line or line == b"\r\n":
                     break
                 headers.append(line)
-                line = line.lower()
-                if line.startswith(b"transfer-encoding"):
-                    if b"chunked" in line:
+                name = None
+                value = None
+                pos = line.find(b":")
+                if pos > 0:
+                    name = line[:pos].lower()
+                    value = line[pos + 1:].strip()
+                
+                if name == b"location":
+                    url = value.decode()
+                elif name == b"transfer-encoding":
+                    if b"chunked" in value.lower():
                         chunked = True
-                elif line.startswith(b"location:"):
-                    url = line.rstrip().split(None, 1)[1].decode()
-                elif line.startswith(b"content-length:"):
+                elif name == b"content-length":
                     if not chunked:
                         try:
-                            content_length = int(line.rstrip().split(None, 1)[1].decode())
+                            content_length = int(value)
                             if content_length < 0:
                                 raise ValueError
                         except (ValueError, TypeError):
                             pass
-                elif line.startswith(b"content-type:"):
-                    if b"application/json" in line:
+                elif name == b"content-type":
+                    value = value.lower()
+                    if b"application/json" in value:
                         json = True
-                    if b"charset" in line:
-                        # get decoder
-                        c_string = line.rstrip().decode()
-                        pos = c_string.find("charset")
+                    c_pos = value.find(b"charset=")
+                    if c_pos > 0:
                         try:
-                            charset = c_string[pos + 8 :].split(";", 1)[0].strip(' "')
+                            charset = value[c_pos + 8:].split(b";", 1)[0].strip(b" \"'").decode()
                         except Exception:
                             pass
             # look for redirects
